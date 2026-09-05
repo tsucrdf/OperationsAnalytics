@@ -14,6 +14,8 @@ RIDER_COLS = [
 
 ROUTE_STRIP_PATTERN = r"_(up|down)|\s(up|down)|_STL|[+-]"
 
+CANONICAL_COLS = ["Date", "Bus Number", "Route Number", "Revenue", "Pass Category"] + RIDER_COLS
+
 
 def find_col(columns, candidates):
     """Case/whitespace-tolerant column lookup."""
@@ -31,6 +33,43 @@ def load_file(uploaded_file):
     if name.endswith(".csv"):
         return pd.read_csv(uploaded_file)
     return pd.read_excel(uploaded_file)
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename each file's columns to a shared canonical name (tolerant of
+    spacing/casing differences between reports) so files from different
+    exports line up correctly when merged."""
+    cols = df.columns.tolist()
+    rename_map = {}
+    for canon in CANONICAL_COLS:
+        found = find_col(cols, [canon])
+        if found and found != canon:
+            rename_map[found] = canon
+    return df.rename(columns=rename_map)
+
+
+def merge_uploaded_files(uploaded_files):
+    """Load, normalize, and concatenate multiple report files into one
+    DataFrame. Returns (merged_df, per_file_summary, per_file_errors)."""
+    frames = []
+    summary = []
+    errors = []
+
+    for f in uploaded_files:
+        try:
+            raw = load_file(f)
+            norm = normalize_columns(raw)
+            norm["Source File"] = f.name
+            frames.append(norm)
+            summary.append((f.name, len(norm)))
+        except Exception as e:
+            errors.append((f.name, str(e)))
+
+    if not frames:
+        return None, summary, errors
+
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    return merged, summary, errors
 
 
 def analyze(df: pd.DataFrame):
@@ -104,25 +143,52 @@ def analyze(df: pd.DataFrame):
 def main():
     st.title("🚌 Conductor Report Board")
     st.caption(
-        "Upload a conductor ticketing report (CSV or Excel) to see buses, routes, "
-        "revenue and ridership per day — split by online and cash sales."
+        "Upload one or more conductor ticketing reports (CSV or Excel) to see buses, "
+        "routes, revenue and ridership per day — split by online and cash sales. "
+        "Multiple files are merged automatically before analysis."
     )
 
-    uploaded_file = st.file_uploader("Drop a report here", type=["csv", "xlsx", "xls"])
+    uploaded_files = st.file_uploader(
+        "Drop one or more reports here",
+        type=["csv", "xlsx", "xls"],
+        accept_multiple_files=True,
+    )
 
-    if uploaded_file is None:
+    if not uploaded_files:
         st.info("Waiting for a file. Expected columns: Date, Bus Number, Route Number, "
-                 "Revenue, Pass Category, and the pass-count columns.")
+                 "Revenue, Pass Category, and the pass-count columns. Upload several "
+                 "files at once (e.g. one per day or per depot) and they'll be merged "
+                 "before analysis.")
+        return
+
+    raw_df, file_summary, file_errors = merge_uploaded_files(uploaded_files)
+
+    for name, err in file_errors:
+        st.warning(f"Skipped **{name}** — couldn't read it: {err}")
+
+    if raw_df is None:
+        st.error("None of the uploaded files could be read.")
         return
 
     try:
-        raw_df = load_file(uploaded_file)
         daily, has_category = analyze(raw_df)
     except Exception as e:
-        st.error(f"Couldn't read that file: {e}")
+        st.error(f"Couldn't analyze the merged data: {e}")
         return
 
-    st.success(f"Loaded **{uploaded_file.name}** — {len(raw_df):,} rows, {len(daily)} days")
+    if len(uploaded_files) > 1:
+        st.success(
+            f"Merged **{len(file_summary)}** file(s) — {len(raw_df):,} total rows, "
+            f"{len(daily)} days"
+        )
+        with st.expander("Rows contributed per file"):
+            st.dataframe(
+                pd.DataFrame(file_summary, columns=["File", "Rows"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+    else:
+        st.success(f"Loaded **{uploaded_files[0].name}** — {len(raw_df):,} rows, {len(daily)} days")
 
     total_revenue = daily["Revenue"].sum()
     total_ridership = daily["Ridership"].sum()
